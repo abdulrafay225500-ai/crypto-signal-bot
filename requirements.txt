@@ -1,0 +1,6 @@
+python-binance==1.0.19
+pandas==2.2.2
+numpy==1.26.4
+pyTelegramBotAPI==4.17.0
+fastapi==0.115.0
+uvicorn==0.30.6
