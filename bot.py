@@ -1,3 +1,4 @@
+# bot.py
 import os
 import time
 import logging
@@ -11,45 +12,37 @@ from binance.client import Client
 import telebot
 from fastapi import FastAPI
 
-# =======================
-# ENV VARS (set these on Render)
-# =======================
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")         # BotFather token
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")       # e.g. @yourchannel OR -100xxxxxxxxxx
-TIMEFRAME        = os.getenv("TIMEFRAME", "5m")        # "5m" or "15m"
-MAX_PAIRS        = int(os.getenv("MAX_PAIRS", "300"))  # how many symbols to scan
-SLEEP_SECONDS    = int(os.getenv("SLEEP_SECONDS", "15"))
-MIN_QVOL         = float(os.getenv("MIN_QVOL", "15000"))  # last-candle quote volume filter
-COOLDOWN         = int(os.getenv("COOLDOWN", "3"))        # candles to wait before repeating same-side signal
+# ============ ENV ============
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")           # BotFather token (paste only in Render env)
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")         # e.g. @yourpublicchannel OR -100xxxxxxxxxx
+TIMEFRAME        = os.getenv("TIMEFRAME", "5m")          # "5m" or "15m"
+MAX_PAIRS        = int(os.getenv("MAX_PAIRS", "300"))    # how many symbols to scan
+SLEEP_SECONDS    = int(os.getenv("SLEEP_SECONDS", "15")) # main loop pause
+MIN_QVOL         = float(os.getenv("MIN_QVOL", "15000")) # last candle quote-volume filter
+COOLDOWN         = int(os.getenv("COOLDOWN", "3"))       # candles to wait before same-side re-signal
 QUOTE_ASSETS     = os.getenv("QUOTE_ASSETS", "USDT,BUSD").split(",")
 
-# Skip pairs whose BASE coin is a stable/fiat (we want BTC/ETH/SOL etc., not USDT base)
-BASE_STABLES = set(
-    os.getenv(
-        "BASE_STABLES",
-        "USDT,USDC,BUSD,FDUSD,TUSD,DAI,USDE,PYUSD,EUR,TRY,BRL"
-    ).split(",")
-)
+# Skip pairs where BASE is a stable/fiat (we want BTC/ETH/SOL/... not USDT base)
+BASE_STABLES = set(os.getenv(
+    "BASE_STABLES",
+    "USDT,USDC,BUSD,FDUSD,TUSD,DAI,USDE,PYUSD,EUR,TRY,BRL"
+).split(","))
 
-# =======================
-# BASIC CHECKS
-# =======================
+# ========= BASIC CHECKS =========
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-    raise SystemExit("Please set TELEGRAM_TOKEN and TELEGRAM_CHAT_ID environment variables.")
+    raise SystemExit("Please set TELEGRAM_TOKEN and TELEGRAM_CHAT_ID environment variables on Render.")
 
-# Public-only client (no trading, no secret needed)
-binance = Client()  # uses public endpoints for market data
+# public-only client (no trading, no api secret needed)
+binance = Client()
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("signals")
 
-def utcnow() -> StringError:
+def utcnow():
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
-# =======================
-# INDICATORS
-# =======================
+# ========= INDICATORS =========
 def EMA(s: pd.Series, n: int) -> pd.Series:
     return s.ewm(span=n, adjust=False).mean()
 
@@ -82,9 +75,7 @@ def ATR(df: pd.DataFrame, n: int = 14) -> pd.Series:
     tr = pd.concat([(h - l), (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
     return tr.rolling(n).mean()
 
-# =======================
-# DATA FETCH
-# =======================
+# ========= DATA FETCH =========
 def get_symbols():
     """All spot symbols quoted in QUOTE_ASSETS, with non-stable BASE coin."""
     info = binance.get_exchange_info()
@@ -104,22 +95,17 @@ def klines_df(symbol: str, interval: str = "5m", limit: int = 200) -> pd.DataFra
     kl = binance.get_klines(symbol=symbol, interval=interval, limit=limit)
     if not kl:
         return pd.DataFrame()
-    df = pd.DataFrame(
-        kl,
-        columns=[
-            'open_time', 'open', 'high', 'low', 'close', 'volume',
-            'close_time', 'qvol', 'num_trades', 'tb_base', 'tb_quote', 'ignore'
-        ],
-    )
-    for c in ['open', 'high', 'low', 'close', 'volume', 'qvol']:
+    df = pd.DataFrame(kl, columns=[
+        'open_time','open','high','low','close','volume',
+        'close_time','qvol','num_trades','tb_base','tb_quote','ignore'
+    ])
+    for c in ['open','high','low','close','volume','qvol']:
         df[c] = df[c].astype(float)
     return df
 
-# =======================
-# STRATEGY
-# =======================
+# ========= STRATEGY =========
 def analyze(df: pd.DataFrame):
-    """EMA20/50 cross + RSI/MACD/Stoch filters + ATR targets"""
+    """EMA20/50 cross + RSI/MACD/Stoch filters + ATR-based SL/TP."""
     if df.empty or len(df) < 80:
         return None
     if df['qvol'].iloc[-1] < MIN_QVOL:
@@ -136,121 +122,8 @@ def analyze(df: pd.DataFrame):
     bull_cross = (ema20.iloc[i-1] < ema50.iloc[i-1]) and (ema20.iloc[i] > ema50.iloc[i])
     bear_cross = (ema20.iloc[i-1] > ema50.iloc[i-1]) and (ema20.iloc[i] < ema50.iloc[i])
 
-    rsi_v = rsi.iloc[i]
-    k_v = k.iloc[i]
-    macd_v = macd.iloc[i]
-    price = c.iloc[i]
-    atr_v = max(float(atr.iloc[i]), 1e-8)
-
-    # Filters to avoid overextended entries
-    if bull_cross and (rsi_v < 68) and (k_v < 85):
-        return {
-            "side": "BUY", "price": price,
-            "sl": round(price - atr_v, 8),
-            "tp1": round(price + atr_v, 8),       # 1:1
-            "tp2": round(price + 2 * atr_v, 8),   # 1:2
-            "rsi": float(rsi_v), "stoch_k": float(k_v), "macd": float(macd_v),
-            "bull": True,
-        }
-    if bear_cross and (rsi_v > 32) and (k_v > 15):
-        return {
-            "side": "SELL", "price": price,
-            "sl": round(price + atr_v, 8),
-            "tp1": round(price - atr_v, 8),       # 1:1
-            "tp2": round(price - 2 * atr_v, 8),   # 1:2
-            "rsi": float(rsi_v), "stoch_k": float(k_v), "macd": float(macd_v),
-            "bull": False,
-        }
-    return None
-
-# =======================
-# TELEGRAM POSTING
-# =======================
-LAST_SIDE = {}          # symbol -> last side posted
-RECENT = {}             # symbol -> deque of recent close_time to avoid duplicates
-
-def reason_text(r: dict) -> str:
-    dirw = "bullish" if r["bull"] else "bearish"
-    macd_side = ">0" if r["macd"] > 0 else "<0"
-    return f"EMA20/50 {dirw} cross | RSI {r['rsi']:.1f} | MACD {macd_side} | Stoch%K {r['stoch_k']:.0f}"
-
-def post_signal(symbol: str, r: dict):
-    text = (
-        f"📡 <b>SIGNAL (SCALP {TIMEFRAME})</b>\n"
-        f"Pair: <code>{symbol}</code>\n"
-        f"Side: <b>{r['side']}</b>\n"
-        f"Entry: <code>{r['price']}</code>\n"
-        f"SL: <code>{r['sl']}</code>\n"
-        f"TP1: <code>{r['tp1']}</code> (1:1)   TP2: <code>{r['tp2']}</code> (1:2)\n"
-        f"Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
-        f"Reason: {reason_text(r)}\n"
-        f"⚠️ DYOR | Info only | Target RR 1:2"
-    )
-    try:
-        bot.send_message(TELEGRAM_CHAT_ID, text)
-        LAST_SIDE[symbol] = r["side"]
-    except Exception as e:
-        log.error(f"Telegram error: {e}")
-
-# =======================
-# MAIN SCAN LOOP
-# =======================
-def scan_loop():
-    # fetch list of symbols once (spot-only)
-    try:
-        symbols = get_symbols()
-        symbols = symbols[:MAX_PAIRS]  # cap for CPU
-        log.info(f"Scanning {len(symbols)} symbols on {TIMEFRAME}")
-    except Exception as e:
-        log.error(f"Exchange info failed, fallback to majors: {e}")
-        symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "BCHUSDT"]
-
-    while True:
-        t0 = time.time()
-        for s in symbols:
-            try:
-                df = klines_df(s, TIMEFRAME, limit=200)
-                if df.empty:
-                    continue
-
-                res = analyze(df)
-                if not res:
-                    continue
-
-                ct = int(df["close_time"].iloc[-1])
-                dq = RECENT.get(s, deque(maxlen=COOLDOWN))
-                # avoid duplicate for same candle
-                if ct in dq:
-                    continue
-                # avoid spamming the same side repeatedly
-                if LAST_SIDE.get(s) == res["side"] and len(dq) < COOLDOWN:
-                    dq.append(ct)
-                    RECENT[s] = dq
-                    continue
-
-                post_signal(s, res)
-                dq.append(ct)
-                RECENT[s] = dq
-
-            except Exception as e:
-                # keep going even if one symbol fails
-                log.debug(f"{s} error: {e}")
-                continue
-
-        elapsed = time.time() - t0
-        time.sleep(max(1, SLEEP_SECONDS - elapsed))
-
-# =======================
-# WEB APP (for Render health)
-# =======================
-app = FastAPI()
-
-@app.get("/")
-def health():
-    return {"ok": True, "timeframe": TIMEFRAME}
-
-def start_worker():
-    th = threading.Thread(target=scan_loop, daemon=True)
-    th.start()
-
-start_worker()
+    rsi_v = float(rsi.iloc[i])
+    k_v   = float(k.iloc[i])
+    macd_v= float(macd.iloc[i])
+    price = float(c.iloc[i])
+    atr_v = max(float(atr.i_
